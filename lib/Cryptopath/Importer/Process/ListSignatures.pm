@@ -4,6 +4,7 @@ use strict;
 use GnuPG::Interface;
 use File::Temp qw( tempdir );
 use Moose;
+use Data::Dumper qw(Dumper);
 
 extends 'Cryptopath::Importer::Process';
 
@@ -16,14 +17,37 @@ sub run {
 
 	while(!$exit) {
 		my $msg = $self->recv();
+		last unless ($msg);
 
 		if ( $msg->{cmd} eq "list_signatures" ) {
 			my $homedir  = $msg->{data}->{homedir};
-			my $key_list = $msg->{data}->{keys};
+			my $key_list = $msg->{data}->{list};
 
 			my $data = $self->process_keys($homedir, @$key_list);
+#			$self->debug( Dumper[ $msg,   { homedir => $homedir, keys => $key_list, data => $data } ] );
 
-			$self->send("keys_parsed", { homedir => $homedir, keys => $key_list, data => $data } );
+			$self->send("signatures", { homedir => $homedir, keys => $key_list, data => $data } );
+
+			my %seen_keys;
+			my @missing;
+			foreach my $row (@$data) {
+				my $long_key  = uc($row->{uid});
+				my $short_key = uc(substr($long_key, -8));
+
+				$seen_keys{$long_key} = 1;
+				$seen_keys{$short_key} = 1;
+
+			}
+
+			foreach my $key (@$key_list) {
+				my $k = uc($key);
+				push @missing, $key unless ( exists $seen_keys{$k} );
+			}
+
+			if ( scalar @missing ) {
+				$self->error("No signatures found for keys: " . join(', ', @missing) . ". Processed keys: " . join(', ', keys %seen_keys));
+				$self->send("signatures_error", { keys => \@missing });
+			}
 		}
 	}
 }
@@ -33,6 +57,8 @@ sub process_keys {
 	my ($self, $homedir, @keys) = @_;
 
 	my @cmd = ($self->gpg_bin, "--homedir", $homedir, "--with-colons", "--fingerprint", "--list-sigs", @keys);
+
+#	$self->debug(join(' ', @cmd));
 
 	open(my $gpg, "-|", @cmd);
 	my @data = <$gpg>;
@@ -44,6 +70,8 @@ sub process_keys {
 	my $fpr;
 	my %sigs;
 	my @ret;
+
+#	$self->debug(join("\n", @data));
 
 	foreach my $line (@data) {
 		my ($type, @parts) = split(/:/, $line);
@@ -65,7 +93,7 @@ sub process_keys {
 		}
 	}
 
-	push @ret, { uid => $cur_uid, fingerprint => $fpr, sigs => \%sigs };
+	push @ret, { uid => $cur_uid, fingerprint => $fpr, sigs => \%sigs } if ( $cur_uid );
 #	handle_sigs($cur_uid, $fpr, \%sigs) if ( $cur_uid );
 
 

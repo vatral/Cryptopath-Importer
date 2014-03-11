@@ -20,10 +20,10 @@ sub run {
 
 		if ( $msg->{cmd} eq "fetch_keys" ) {
 			my $homedir  = $msg->{data}->{homedir};
-			my $key_list = $msg->{data}->{keys};
+			my $key_list = $msg->{data}->{list};
 
 			$self->fetch_keys($homedir, @$key_list);
-			$self->send("keys_received", { homedir => $homedir, keys => $key_list });
+			$self->send("keys_received", { homedir => $homedir, list => $key_list });
 		}
 	}
 }
@@ -33,10 +33,10 @@ sub run {
 sub fetch_keys {
 	my ($self, $homedir, @keys)  = @_;
 
-	print "Receiving keys: " . join(' ', @keys) . "\n";
+#	$self-> "Receiving keys: " . join(' ', @keys) . "\n";
 	my @cmd = ($self->gpg_bin, "--homedir", $homedir, "--keyserver", $self->keyserver, "-q", "--recv-keys", @keys);
 
-	print "Executing: " . join(' ', @cmd) . "\n";
+#	$self->debug("Executing: " . join(' ', @cmd));
 	open(my $gpg, "-|", @cmd);
 	my $ret = <$gpg>;
 	close $gpg;

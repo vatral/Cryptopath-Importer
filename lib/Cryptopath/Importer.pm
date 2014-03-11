@@ -9,12 +9,16 @@ use BerkeleyDB;
 use File::Temp qw( tempdir );
 use Socket;
 use IO::Select;
-use Cryptopath::Importer::Util;
+use Cryptopath::Importer::Util qw(enqueue_message send_message recv_message);
 use Data::Dumper qw(Dumper);
 use POSIX ":sys_wait_h";
+use Time::HiRes qw(gettimeofday tv_interval);
+use File::Path qw(remove_tree);
 
+has 'base_class'       => ( is => 'rw', isa => 'Str', default => "Cryptopath::Importer::Process" ); # Base class for all processes
+has 'class_prefix'     => ( is => 'rw', isa => 'Str', default => 'Cryptopath::Importer::Process' ); # Prefix for short class names
+has 'max_queue_length' => ( is => 'rw', isa => 'Int', default => 4 );
 
-has 'base_class' => (  is => 'rw', isa => 'Str', default => "Cryptopath::Importer::Process" );
 
 sub init {
 	my ($self) = @_;
@@ -22,6 +26,7 @@ sub init {
 	$self->{loaded_packages} = {};
 	$self->{proc_bypid} = {};
 	$self->{proc_bycls} = {};
+	$self->{sigint} = 0;
 
 
 	$SIG{CHLD} = sub {
@@ -32,6 +37,12 @@ sub init {
 		}
 	};
 
+	$SIG{INT} = sub {
+		$self->{sigint}++;
+	};
+
+	$self->_create_process( "Cryptopath::Importer::Process::KeyLister" );
+	$self->_create_process( "Cryptopath::Importer::Process::KeyChecker" );
 	$self->_create_process( "Cryptopath::Importer::Process::HKP" );
 	$self->_create_process( "Cryptopath::Importer::Process::ListSignatures" );
 	$self->_create_process( "Cryptopath::Importer::Process::Postgres" );
@@ -42,10 +53,19 @@ sub init {
 sub run {
 	my ($self) = @_;
 
-	my $terminate;
+	my $abort;
 
+	$self->{raw_key_ids_buf}  = [];  # Known IDs
+	$self->{good_key_ids_buf} = []; # Verified not to exist in DB
+	$self->{recv_key_ids_buf} = []; # Received from keyserver
+	$self->{signatures_buf}   = []; # Signatures
 
-	while(!$terminate && scalar keys %{ $self->{proc_bypid} }) {
+	$self->{stat_keys_started}    = 0;
+	$self->{stat_keys_added}      = 0;
+	$self->{stat_keys_existing}   = 0;
+	$self->{stat_keys_sign_error} = 0;
+
+	while(!$abort && scalar keys %{ $self->{proc_bypid} }) {
 		my $want_read   = IO::Select->new();
 		my $want_write  = IO::Select->new();
 		my $want_except = IO::Select->new();
@@ -62,6 +82,10 @@ sub run {
 			if ( exists $p->{sock} ) {
 				$want_read->add( $p->{sock} );
 			}
+
+			if (scalar @{ $p->{commands} }) {
+				$want_write->add( $p->{sock} );
+			}
 		}
 
 		foreach my $pid ( @dead_procs ) {
@@ -71,6 +95,13 @@ sub run {
 		
 		my ($can_read, $can_write, $has_exception) = 
 			IO::Select::select( $want_read, $want_write, $want_except );
+
+		if ( $self->{sigint} == 1 ) {
+			$self->_message( $self, 4, "SIGINT received, stopping");
+			$self->_stop_all();
+		} elsif ( $self->{sigint} > 1 ) {
+			$abort = 1;
+		}
 
 		foreach my $handle ( @$can_read ) {
 			#print "Can read: $handle\n";
@@ -93,11 +124,80 @@ sub run {
 
 			if ( $cmd eq "message" ) {
 				$self->_message( $proc, $data->{severity}, $data->{message});
+			} elsif ( $cmd eq "keys" ) {
+				push @{ $self->{raw_key_ids_buf} }, @{ $data->{list} };
+				$self->{stat_keys_started} += scalar @{ $data->{list} };
+
+#				$self->_message( $self, 1, "Keys received");
+			} elsif ( $cmd eq "verified_keys" ) {
+				push @{ $self->{good_key_ids_buf} }, @{ $data->{list} };
+				#$self->_message( $self, 1, "Good keys received, first: " . $data->{list}->[0]);
+			} elsif ( $cmd eq "existing_keys" ) {
+				$self->{stat_keys_existing} += scalar @{ $data->{list} };
+			} elsif ( $cmd eq "keys_received" ) {
+				push @{ $self->{recv_key_ids_buf} }, $data;
+			} elsif ( $cmd eq "signatures" ) {
+
+				foreach my $keysigs( @{$data->{data}} ) {
+					push @{ $self->{signatures_buf} }, $keysigs;
+				}
+
+				remove_tree( $data->{homedir} );
+			} elsif ( $cmd eq "signatures_error" ) {
+				$self->{stat_keys_sign_error} += scalar @{ $data->{keys} };
+			} elsif ( $cmd eq "key_added" ) {
+				$self->{stat_keys_added}++;
+			} else {
+				$self->_message( $self, 3, "Unrecognized message: $cmd");
 			}
 
 	#		print "Message: " . Dumper([$msg]) . "\n";
 		}
 
+
+		foreach my $handle( @$can_write ) {
+			my $proc = $self->_find_process($handle);
+
+			if ( scalar @{ $proc->{commands} } ) {
+				my $cmd = shift @{ $proc->{commands} };
+				send_message( $handle, $cmd );
+			}
+		}
+
+		if ( scalar @{ $self->{good_key_ids_buf} } < 32 
+		  && scalar @{ $self->{raw_key_ids_buf} } < 128 &&
+		    !$self->_is_busy('KeyLister')) {
+			$self->_send_cmd("KeyLister", "get_keys", { count => 16 } );
+		}
+
+		if ( scalar @{ $self->{raw_key_ids_buf} } > 0 && 
+		  ! $self->_is_busy('KeyChecker') ) {
+			$self->_send_cmd("KeyChecker", "check_keys", { list => $self->{raw_key_ids_buf} } );
+			$self->{raw_key_ids_buf} = [];
+		}
+
+		if ( scalar @{ $self->{good_key_ids_buf} } > 0 &&
+		  ! $self->_is_busy('HKP')) {
+			my @ids = splice(@{$self->{good_key_ids_buf} }, 0, 10);
+			my $homedir = tempdir( cleanup => 0 );
+
+			$self->_send_cmd("HKP", "fetch_keys", { homedir => $homedir, list => \@ids });
+		}
+
+		if ( scalar @{ $self->{recv_key_ids_buf} } > 0 &&
+		  ! $self->_is_busy('ListSignatures')) {
+			my $entry = shift @{ $self->{recv_key_ids_buf} };
+			$self->_send_cmd("ListSignatures", "list_signatures", $entry);
+		}
+
+		if ( scalar @{ $self->{signatures_buf} } > 0 &&
+		  ! $self->_is_busy('Postgres')) {
+			my $entry = shift $self->{signatures_buf};
+			$self->_send_cmd('Postgres', "add_key", $entry);
+		}
+
+
+		$self->_status();
 	}
 
 
@@ -109,43 +209,84 @@ sub run {
 
 	exit(1);
 
+}
 
+sub _erase_status {
+	my ($self) = @_;
+	my $chars = $self->{erase_chars} // 0;
+	print STDERR "\r" . (" " x $chars) . "\r";
+}
 
-	my $dir       = "/srv/sks/dump/KDB";
-	my $keyserver = "hkp://localhost:11371";
-	my $homedir   = tempdir( CLEANUP => 1 );
+sub _status {
+	my ($self, $force) = @_;
+	my $txt;
 
+	if ( $force || ( exists $self->{prev_time} && tv_interval($self->{prev_time}) < 0.25 ) ) {
+		# Hasn't been long enough since last call
+		# We don't want to bog down the CPU with status updates
+		return;
+	}
+	
+	$txt  = "Buf: " . scalar @{ $self->{raw_key_ids_buf}};
+	$txt .= "/"     . scalar @{ $self->{good_key_ids_buf}};
+	$txt .= "/"     . scalar @{ $self->{recv_key_ids_buf}};
+	$txt .= "/"     . scalar @{ $self->{signatures_buf}};
 
-	my %keys;
-	my $db = tie %keys, 'BerkeleyDB::Btree', -Filename => "$dir/keyid", -Flags => DB_RDONLY;
-	my @keys;
+	$txt .= ", keys loaded: " . $self->{stat_keys_started};
+	$txt .= ", added: " . $self->{stat_keys_added};
+	$txt .= ", existing: " . $self->{stat_keys_existing};
+	$txt .= ", no signatures: " . $self->{stat_keys_sign_error};
 
+	$self->_erase_status();
+	$self->{erase_chars} = length($txt);
+	$self->{prev_time} = [gettimeofday];
 
+	print STDERR $txt;
+}
 
-	while( my ($key, $val) = each %keys ) {
+sub _get_proc {
+	my ($self, $proc) = @_;
+	my $p;
 
-		my $k = unpack("H*", $key);
-		my $v = unpack("H*", $val);
-		print "$k: $v\n";
-
-		push @keys, $k;
-
-		if ( scalar @keys >= 10 ) {
-			#unlink($keyring);
-
-
-	#		my @missing;
-	#		@missing = grep { !key_exists($_) } @keys;
-	#
-	#
-	#		fetch_keys(@missing);
-	#		process_keys(@missing);
-	#		@keys = ();
-	#
-	#	#idie;
+	if ( ref($proc) ) {
+		# Send to indicated process
+		$p = $proc;
+	} else {
+		# Send to class
+		if (!exists $self->{proc_bycls}{$proc}) {
+			$proc = $self->base_class . "::$proc";
 		}
+
+		die "Class not found" unless (exists $self->{proc_bycls}{$proc});
+
+		my $min_cmds = 2^31;
+
+		foreach my $pid ( keys %{ $self->{proc_bycls}->{$proc} }) {
+			my $count = scalar @{ $self->{proc_bypid}{$pid}{commands} };
+			if ( $count < $min_cmds ) {
+				$min_cmds = $count;
+				$p        = $self->{proc_bypid}{$pid};
+			}
+		}
+
+		die "No processes in class $proc" unless ($p);
 	}
 
+	return $p;
+}
+
+sub _send_cmd {
+	my ($self, $proc, $cmd, $data) = @_;
+
+	my $p = $self->_get_proc($proc);
+	enqueue_message($p->{commands}, $cmd, $data);
+}
+
+sub _is_busy {
+	my ($self, $proc) = @_;
+	my $p = $self->_get_proc($proc);
+
+	return ( scalar @{ $p->{commands} } >= $self->max_queue_length );
 }
 
 
@@ -161,7 +302,14 @@ sub _create_process {
 	if ( $pid ) {
 		print STDERR "Starting process $pid for $class\n";
 		close $child_sock;
-		my $proc_info = { class => $class, sock => $parent_sock, pid => $pid, status => 'alive' };
+
+		my $proc_info = {
+			class     => $class,
+			sock      => $parent_sock,
+			pid       => $pid,
+			status    => 'alive',
+			commands  => []
+		};
 
 		$self->{proc_bypid}{$pid} = $proc_info;
 		$self->{proc_bycls}{$class} = {} unless ( exists $self->{proc_bycls}{$class});
@@ -172,7 +320,10 @@ sub _create_process {
 		eval {
 			$SIG{CHLD} = 'IGNORE';
 			close $parent_sock;
-
+			close STDOUT;
+			close STDERR;
+			open 'STDOUT', '>', '/dev/null';
+			open 'STDERR', '>', '/dev/null';
 
 			my $instance = $self->_instantiate($class);
 			my $retval;
@@ -239,6 +390,8 @@ sub _find_process {
 	my ($self, $socket) = @_;
 
 	foreach my $pid ( keys %{ $self->{proc_bypid} } ) {
+		next unless ( exists $self->{proc_bypid}{$pid}->{sock} );
+
 		if ( $self->{proc_bypid}{$pid}->{sock} == $socket ) {
 			return $self->{proc_bypid}{$pid};
 		}
@@ -297,7 +450,10 @@ sub _message {
 		$cls = $class;
 	}
 
+	$self->_erase_status();
 	print STDERR "L$severity [$cls] $msg\n";
+	$self->_status(1);
+
 }
 
 
