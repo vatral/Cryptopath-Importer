@@ -11,6 +11,10 @@ has 'socket' => ( is => 'rw', isa => 'FileHandle' );
 
 sub init {
 	my ($self) = @_;
+
+	$SIG{__WARN__} = sub { $self->warn(@_); };
+	$SIG{__DIE__} = sub { $self->error(@_); };
+
 	$self->status("Started");
 }
 
