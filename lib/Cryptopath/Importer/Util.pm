@@ -8,12 +8,32 @@ BEGIN {
 	require Exporter;
 	our @ISA = qw(Exporter);
 	our @EXPORT = qw( &send_message &recv_message );
+	our @EXPORT_OK = qw( create_message enqueue_message );
+}
+
+sub create_message {
+	my ($msg, $data) = @_;
+
+	return encode_json( { cmd => $msg, data => $data });
+}
+
+sub enqueue_message {
+	my ($list, $msg, $data) = @_;
+	die "Array required" unless ref($list) eq "ARRAY";
+	push @$list, create_message($msg, $data);
 }
 
 sub send_message {
 	my ($socket, $msg, $data) = @_;
+	my $json;
 
-	my $json = encode_json( { cmd => $msg, data => $data });
+	if ( defined $data ) {
+		# Normal message
+		$json = create_message($msg, $data);
+	} else {
+		# Already encoded, from a queue
+		$json = $msg;
+	}
 
 	syswrite $socket, length($json) . "\n";
 	syswrite $socket, $json;
